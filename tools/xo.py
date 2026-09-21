@@ -7,6 +7,10 @@ read from source.
 
     XO_URL=wss://192.168.1.5/api/ XO_TOKEN=... XO_TRUST_SELF_SIGNED=1 python3 tools/xo_probe.py
 
+A ws:// URL is refused: /api/ is served on both schemes, so the missing letter connects,
+signs in, works, and puts the token on the wire in the clear every run. XO_ALLOW_CLEARTEXT=1
+overrides it and warns.
+
 Three things about this transport that the REST one does not have, and that the plugin
 will have to handle:
 
@@ -28,6 +32,8 @@ import ssl
 import sys
 import time
 
+from xo_util import env_flag, transport_refusal
+
 try:
     import websocket  # websocket-client
 except ImportError:  # pragma: no cover - dependency check, mirrors the other tools
@@ -39,6 +45,10 @@ except ImportError:  # pragma: no cover - dependency check, mirrors the other to
     raise
 
 DEFAULT_TIMEOUT = 120.0
+
+# The one handshake status that means a WebSocket exists. Named rather than inlined because
+# 101 appears beside a list of redirect codes below and the two must not blur together.
+SWITCHING_PROTOCOLS = 101
 
 
 class XoError(RuntimeError):
@@ -62,6 +72,15 @@ def _from_env(name):
 class Xo:
     def __init__(self, url=None, token=None, trust_self_signed=None, timeout=DEFAULT_TIMEOUT):
         self.url = url or _from_env("XO_URL")
+
+        # ws:// is the trap this catches, and it is easier to reach than http:// is on the
+        # REST side: the appliance serves both schemes on /api/, so a URL with the one
+        # letter missing connects, signs in, and works -- while putting the token on the
+        # wire in the clear on every run. Nothing downstream would ever complain.
+        refusal = transport_refusal(self.url, "wss")
+        if refusal:
+            raise XoError("INSECURE_TRANSPORT", refusal)
+
         self._token = token or _from_env("XO_TOKEN")
         self.timeout = timeout
         self._ws = None
@@ -71,9 +90,7 @@ class Xo:
         # Same posture as the XAPI client and as the plugin's trustSelfSigned checkbox:
         # opt-in, off by default, and it says so out loud when it is on.
         if trust_self_signed is None:
-            trust_self_signed = os.environ.get("XO_TRUST_SELF_SIGNED", "").lower() in (
-                "1", "true", "yes",
-            )
+            trust_self_signed = env_flag("XO_TRUST_SELF_SIGNED")
         self._trust_self_signed = trust_self_signed
         if trust_self_signed:
             print(
@@ -88,9 +105,65 @@ class Xo:
         sslopt = None
         if self._trust_self_signed:
             sslopt = {"cert_reqs": ssl.CERT_NONE, "check_hostname": False}
-        self._ws = websocket.create_connection(self.url, sslopt=sslopt, timeout=self.timeout)
-        self.user = self.call("session.signInWithToken", {"token": self._token})
+        # redirect_limit=0, and then check the handshake ourselves. Both halves are needed.
+        #
+        # websocket-client follows up to THREE redirects by default (_core.py, the loop over
+        # `options.pop("redirect_limit", 3)`), reconnecting to whatever `location` names, on
+        # 301/302/303/307/308 and with no check on the target's scheme or host. The token is
+        # sent after create_connection returns, so a vetted wss:// URL that redirects can put
+        # it on a socket to another host, or to plain ws://. The scheme check above vets the
+        # address we dial; it cannot vet an address the library dials for us. Same class of
+        # bug as the Cookie-on-redirect one in xo_rest.py, on the transport that carries the
+        # same token.
+        #
+        # The status check is not belt and braces. handshake() treats the five redirect codes
+        # as SUCCESS_STATUSES and returns rather than raising (_handshake.py), so with the
+        # limit at zero the loop simply does not run and `connected = True` is set on a
+        # connection that never upgraded. Read in websocket-client 1.9.0, the version CI
+        # installs; a later release added a "Redirect limit exhausted" raise, so this check is
+        # also what keeps the behaviour the same across versions the lock file does not pin.
+        self._ws = websocket.create_connection(
+            self.url, sslopt=sslopt, timeout=self.timeout, redirect_limit=0
+        )
+        handshake = getattr(self._ws, "handshake_response", None)
+        status = getattr(handshake, "status", None)
+        if status != SWITCHING_PROTOCOLS:
+            self._close_quietly()
+            raise XoError(
+                "NOT_UPGRADED",
+                f"{self.url} answered {status} rather than 101 and no token was sent. A "
+                f"redirect here is refused on purpose: following it would hand the token "
+                f"to whatever the appliance pointed at.",
+            )
+        try:
+            self.user = self.call("session.signInWithToken", {"token": self._token})
+        except BaseException:
+            # The socket is open and unauthenticated at this point. __enter__ propagates
+            # this, so __exit__ never runs and nothing else will ever close it: the
+            # appliance holds the connection until it times out, and a harness that
+            # retries in a loop stacks one per attempt.
+            self._close_quietly()
+            raise
         return self.user
+
+    def _close_quietly(self):
+        """Close the socket, swallowing a close that itself fails.
+
+        Both failure paths in connect() need this, and for the same reason: the socket has
+        to go, and the error already in hand explains why the caller is here, so a dying
+        socket reporting that it is dying must not replace it. The handle goes either way,
+        because close() clears it in a finally.
+
+        It is a method rather than four inlined lines because the first version of connect()
+        inlined it on the sign-in path and left the handshake path bare, so a close that
+        raised there replaced XoError("NOT_UPGRADED") with the OSError and escaped through
+        every caller that handles only XoError. Caught by review on #234. Two paths with one
+        rule between them is the shape that stops it recurring.
+        """
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def close(self):
         if self._ws is not None:
