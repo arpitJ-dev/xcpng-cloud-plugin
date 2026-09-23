@@ -345,6 +345,120 @@ class XoRestClientTest {
         new XoRestClient(t).destroyWithDisks(new VmRef(CLONE)); // must not throw
     }
 
+    /**
+     * The XAPI backend refuses a handle it never minted (#223) because XAPI answers one with
+     * HANDLE_INVALID, which its already-gone rule reads as "destroyed". This direction is worse, and that
+     * is why the guard is here rather than left to the appliance: measured on the lab pool 2026-09-20, XO
+     * resolves a XAPI {@code OpaqueRef} wherever it takes a VM id, and DELETE on one answered 204. So a
+     * misrouted ref does not harmlessly 404 here, it can destroy the VM the caller did not name.
+     *
+     * <p>Asserting that nothing was sent is the point. An exception alone would still pass against a client
+     * that issued the DELETE and then threw.
+     */
+    @Test
+    void destroyRefusesAXapiHandleWithoutSendingAnything() {
+        ScriptedRest t = new ScriptedRest();
+        HypervisorException e = assertThrows(
+                HypervisorException.class,
+                () -> new XoRestClient(t).destroyWithDisks(new VmRef("OpaqueRef:9b1f-dead-beef")));
+
+        assertTrue(e.getMessage().contains("XAPI handle"), e.getMessage());
+        assertTrue(t.destroyed.isEmpty(), "nothing may reach the appliance: " + t.destroyed);
+        assertTrue(t.calls.isEmpty(), "not even a request: " + t.calls);
+    }
+
+    /**
+     * Object ids are deliberately not percent-encoded into the path, so a value carrying a slash, a query
+     * or a fragment addresses a different route. That route answers 404, which the old bare status check
+     * read as a clean teardown.
+     */
+    @Test
+    void destroyRefusesARefThatWouldAddressADifferentRoute() {
+        for (String mangled : new String[] {"abc/def", "abc?x=1", "abc#frag"}) {
+            ScriptedRest t = new ScriptedRest();
+            HypervisorException e = assertThrows(
+                    HypervisorException.class,
+                    () -> new XoRestClient(t).destroyWithDisks(new VmRef(mangled)),
+                    "'" + mangled + "' must be refused");
+            assertTrue(e.getMessage().contains("not a VM id from this backend"), e.getMessage());
+            assertTrue(t.calls.isEmpty(), "nothing may be sent for '" + mangled + "': " + t.calls);
+        }
+    }
+
+    /**
+     * A 404 is the goal state only when XO itself said so. An appliance below the 6.5.0 floor, a reverse
+     * proxy that does not map {@code /rest/v0}, and a renamed route all answer 404 too, and every one of
+     * them was being recorded as a clean teardown. The caller stops retrying on that, so the VM becomes
+     * invisible to the plugin rather than merely un-destroyed.
+     *
+     * <p>The XAPI backend's equivalent rule checks the error parameters name the very ref being destroyed,
+     * on the stated grounds that the code alone is not enough. This is the same argument.
+     */
+    @Test
+    void aFourOhFourThatIsNotXosOwnIsNotACleanTeardown() {
+        for (String body : new String[] {"<html><body>404 Not Found</body></html>", "", "{\"message\":\"nope\"}"}) {
+            ScriptedRest t = new ScriptedRest();
+            t.fail("DELETE", "/rest/v0/vms/" + CLONE, 404, body);
+            assertThrows(
+                    HypervisorException.class,
+                    () -> new XoRestClient(t).destroyWithDisks(new VmRef(CLONE)),
+                    "a 404 without XO's envelope must not be swallowed: " + body);
+        }
+    }
+
+    /**
+     * A 202 is XO saying it started a task, not that it did the work. {@code isSuccess} is
+     * {@code status / 100 == 2}, so it was passing as a synchronous answer, and {@code ?sync=true} is a
+     * request rather than a guarantee: an appliance that does not know the parameter ignores it, and the
+     * 6.5.0 floor lives in a javadoc rather than in a runtime check.
+     *
+     * <p>The clone case is the expensive one and is asserted on its own below. This covers the rest.
+     */
+    @Test
+    void anAcceptedTaskIsRefusedRatherThanReadAsDone() {
+        ScriptedRest started = new ScriptedRest();
+        started.fail("DELETE", "/rest/v0/vms/" + CLONE, 202, "{\"id\":\"task-7\"}");
+        HypervisorException e = assertThrows(
+                HypervisorException.class, () -> new XoRestClient(started).destroyWithDisks(new VmRef(CLONE)));
+        assertTrue(e.getMessage().contains("202"), e.getMessage());
+        assertTrue(e.getMessage().contains("6.5.0"), "the operator needs the version: " + e.getMessage());
+
+        ScriptedRest starting = new ScriptedRest();
+        starting.fail("POST", "/rest/v0/vms/" + CLONE + "/actions/start?sync=true", 202, "{\"id\":\"task-8\"}");
+        HypervisorException started2 =
+                assertThrows(HypervisorException.class, () -> new XoRestClient(starting).start(new VmRef(CLONE)));
+        // A consequence that does not apply is worse than none: nothing is left behind by a refused start.
+        assertFalse(started2.getMessage().contains("no owner tag"), started2.getMessage());
+    }
+
+    /**
+     * The worst shape of the 202, and the reason the guard is worth its lines. {@code cloneFromTemplate}
+     * reads {@code id} off the body, so a 202 carrying a <em>task</em> id would make the task id the VM
+     * ref: the sizing PATCH 404s against it, the cleanup DELETE addresses the task, and the clone that was
+     * really created runs on with no owner tag and no ref recorded anywhere.
+     */
+    @Test
+    void acceptedOnCreateNeverBecomesAVmRef() {
+        ScriptedRest t = new ScriptedRest();
+        t.fail("POST", "/rest/v0/pools/" + POOL + "/actions/create_vm?sync=true", 202, "{\"id\":\"task-9\"}");
+        XoRestClient c = new XoRestClient(t);
+        VmRef template = c.resolveTemplate("jenkins-agent-debian13-v7");
+
+        HypervisorException e = assertThrows(HypervisorException.class, () -> c.cloneFromTemplate(template, spec()));
+
+        assertTrue(e.getMessage().contains("202"), e.getMessage());
+        assertFalse(
+                t.paths().stream().anyMatch(p -> p.contains("task-9")),
+                "a task id must never be addressed as a VM: " + t.paths());
+        // Raised in review on #239. The refusal throws before any VM id comes back, so the self-cleanup
+        // never runs and XO may still finish the task. Jenkins retries, so that is one untagged VM per
+        // attempt and the sweeps select on the marker, so nobody finds them. The message has to say it.
+        assertTrue(
+                e.getMessage().contains("agent-1"),
+                "the operator needs the name of the VM that may be left behind: " + e.getMessage());
+        assertTrue(e.getMessage().contains("no owner tag"), e.getMessage());
+    }
+
     @Test
     void destroyPropagatesAnythingThatIsNotAMissingObject() {
         ScriptedRest t = new ScriptedRest();

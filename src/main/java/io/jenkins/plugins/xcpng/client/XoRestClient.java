@@ -123,6 +123,22 @@ public final class XoRestClient implements HypervisorClient {
      */
     @NonNull
     private JsonNode call(String method, String path, @CheckForNull ObjectNode body, Duration timeout) {
+        return call(method, path, body, timeout, null);
+    }
+
+    /**
+     * As above, with a sentence naming what a refused 202 may have left behind.
+     *
+     * <p>Only the create call passes one. Everywhere else a refused 202 leaves nothing to clean up, and a
+     * consequence that does not apply is worse than none.
+     */
+    @NonNull
+    private JsonNode call(
+            String method,
+            String path,
+            @CheckForNull ObjectNode body,
+            Duration timeout,
+            @CheckForNull String consequence) {
         RestTransport.RestResponse resp;
         try {
             resp = transport.send(method, path, body == null ? null : body.toString(), timeout);
@@ -136,7 +152,40 @@ public final class XoRestClient implements HypervisorClient {
         if (!resp.isSuccess()) {
             throw failure(method, path, resp.status(), resp.body());
         }
+        refuseAsyncAccepted(method, path, resp, consequence);
         return parse(method + " " + path, resp.body());
+    }
+
+    /**
+     * Refuse a 202, which is XO saying it started a task rather than doing the work.
+     *
+     * <p>Every lifecycle call here asks for {@code ?sync=true}, but that is a request and not a guarantee:
+     * an appliance that does not know the parameter ignores it, the way any HTTP API ignores an unknown
+     * query parameter, and the 6.5.0 floor this backend needs lives in {@code XcpngBackend}'s javadoc
+     * rather than in a runtime check. {@code RestResponse.isSuccess} is {@code status / 100 == 2}, so a
+     * 202 was passing as a synchronous answer.
+     *
+     * <p>What that costs is worth spelling out, because it is silent. {@code cloneFromTemplate} reads
+     * {@code id} off the body, so a 202 carrying a <em>task</em> id makes the task id the VM ref. The
+     * sizing PATCH then 404s against it, the cleanup DELETE addresses the task, and the clone that was
+     * really created is left running with no owner tag and no ref recorded anywhere. The existing test
+     * asserting {@code sync=true} is on the URL pins the request and says nothing about the response.
+     *
+     * <p>Refusing beats waiting on the task. Teaching this client XO's task-polling protocol would be a
+     * second code path exercised only against appliances the backend does not claim to support, and an
+     * operator is better served by being told their appliance is too old than by the plugin quietly
+     * working one way here and another way there.
+     */
+    private static void refuseAsyncAccepted(
+            String method, String path, RestTransport.RestResponse resp, @CheckForNull String consequence) {
+        if (resp.status() != 202) {
+            return;
+        }
+        throw new HypervisorException(method + " " + path + ": the appliance answered 202 Accepted, so it started"
+                + " a background task instead of doing the work. This backend asks every call for"
+                + " ?sync=true and needs Xen Orchestra 6.5.0 or newer; an older appliance ignores the"
+                + " parameter. Upgrade Xen Orchestra, or use the XAPI backend."
+                + (consequence == null ? "" : " " + consequence));
     }
 
     @NonNull
@@ -379,8 +428,17 @@ public final class XoRestClient implements HypervisorClient {
         create.put("boot", false); // the caller starts it, after the seed is written
         // Deliberately no "vifs". See the class javadoc: this route inherits the template's, and passing
         // them adds a second NIC.
+        // The consequence matters only here. A refused 202 throws before any VM id comes back, so the
+        // self-cleanup below never runs -- and XO may still finish the task, leaving a clone with no owner
+        // tag. Jenkins retries provisioning, so that is one untagged VM per attempt, findable by nobody:
+        // the sweeps select on the marker. The operator cannot act on that unless the message says it.
         JsonNode created = call(
-                "POST", API + "/pools/" + handle.poolId() + "/actions/create_vm?sync=true", create, ACTION_TIMEOUT);
+                "POST",
+                API + "/pools/" + handle.poolId() + "/actions/create_vm?sync=true",
+                create,
+                ACTION_TIMEOUT,
+                "The task may still finish and create a VM named '" + spec.name() + "' carrying no owner tag,"
+                        + " which no sweep will find; remove it by hand.");
         String vm = created.path("id").asText("");
         if (vm.isBlank()) {
             throw new HypervisorException("create_vm answered success but named no VM: " + created);
@@ -619,6 +677,7 @@ public final class XoRestClient implements HypervisorClient {
      */
     @Override
     public void destroyWithDisks(@NonNull VmRef vm) {
+        refuseForeignHandle(vm);
         String path = API + "/vms/" + vm.value();
         RestTransport.RestResponse resp;
         try {
@@ -626,15 +685,73 @@ public final class XoRestClient implements HypervisorClient {
         } catch (IOException e) {
             throw new HypervisorException("DELETE " + path + ": transport error: " + e.getMessage(), e);
         }
+        // Checked here too, not only in call(): this verb talks to the transport directly, so it would
+        // otherwise read a 202 as a completed teardown and drop the leaked-VM entry for a VM still running.
+        refuseAsyncAccepted("DELETE", path, resp, null);
         if (resp.isSuccess()) {
             return;
         }
-        if (resp.status() == 404) {
+        if (resp.status() == 404 && isXoFailure(resp.body())) {
             LOGGER.info(() ->
                     "VM " + vm.value() + " was already gone when teardown reached it;" + " treating that as destroyed");
             return;
         }
         throw failure("DELETE", path, resp.status(), resp.body());
+    }
+
+    /**
+     * Refuse a handle this backend never minted, the XO counterpart of {@link XapiClient}'s own check (#223).
+     *
+     * <p>The XAPI side refuses a foreign handle because XAPI answers one with {@code HANDLE_INVALID}, which
+     * its already-gone rule reads as "destroyed". This direction is worse, and the measurement is the reason
+     * the guard is here rather than left to the appliance: <b>XO resolves a XAPI {@code OpaqueRef} wherever
+     * it takes a VM id</b>. Measured on the lab pool 2026-09-20, {@code GET /rest/v0/vms/<OpaqueRef>}
+     * returned the VM and {@code DELETE} answered 204. So a ref misrouted into an XO client does not
+     * harmlessly 404; against the same pool it can destroy the VM the caller did not name.
+     *
+     * <p>The punctuation check is not decoration. Object ids come from XO and are deliberately not
+     * percent-encoded on the way into the path ({@link #encodeSegment}'s contract), so a value carrying a
+     * slash, a query or a fragment addresses a different route entirely. That route answers 404, and a bare
+     * status check would have read it as a clean teardown.
+     */
+    private static void refuseForeignHandle(@NonNull VmRef vm) {
+        String ref = vm.value();
+        if (ref.startsWith(XapiClient.REF_PREFIX)) {
+            throw new HypervisorException("refusing to destroy " + ref + ": that is a XAPI handle, and this is the"
+                    + " Xen Orchestra backend. A VM is only destroyable through the backend that created it;"
+                    + " this appliance would resolve it and delete whatever it names.");
+        }
+        // Blank is deliberately not checked: VmRef's own constructor refuses null and blank, so a check
+        // here would be unreachable and no test could make it fire.
+        if (ref.indexOf('/') >= 0 || ref.indexOf('?') >= 0 || ref.indexOf('#') >= 0) {
+            throw new HypervisorException("refusing to destroy '" + ref + "': not a VM id from this backend."
+                    + " It would address a different route, whose 404 reads as an already-destroyed VM.");
+        }
+    }
+
+    /**
+     * Whether a failure body is XO's own envelope rather than something else that answered.
+     *
+     * <p>Used to qualify the 404 that teardown treats as its goal state. The XAPI backend's equivalent rule
+     * checks the error <em>parameters</em> name the very ref being destroyed, on the stated grounds that the
+     * code alone is not enough. The bare status check this replaces was weaker than that: an XO below the
+     * 6.5.0 floor, a reverse proxy that does not map {@code /rest/v0}, or a renamed route all answer 404,
+     * and every one of them was being recorded as a clean teardown. The caller then stops retrying, so the
+     * VM becomes invisible to the plugin rather than merely un-destroyed.
+     *
+     * <p>Checking for the envelope rather than for a message is the narrowest thing that separates those:
+     * XO's own handler always carries {@code error}, and a proxy page carries no JSON at all.
+     */
+    private static boolean isXoFailure(@CheckForNull String body) {
+        if (body == null || body.isBlank()) {
+            return false;
+        }
+        try {
+            JsonNode parsed = MAPPER.readTree(body);
+            return parsed != null && parsed.hasNonNull("error");
+        } catch (IOException notJson) {
+            return false;
+        }
     }
 
     /**
